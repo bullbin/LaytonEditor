@@ -10,6 +10,10 @@ from PySide6 import QtGui
 import numpy as np
 import ndspy.color
 
+from fezzypixels.shift import rgb888_to_norm
+from fezzypixels.palette import median_cut_srgb_palette, flatten_with_flat_roi_enhancement, refine_palette
+from fezzypixels.preprocess import pattern_dither_to_srgb555
+from fezzypixels.error_diffuse import error_diffusion_dither_srgb
 
 class BGImage(FileFormat):
     """
@@ -147,14 +151,18 @@ class BGImage(FileFormat):
         """
         # Find out why palette breaks close to 256 colors (keeping at 200 colors for consistency w/ the game)
         # 199 colors + 1 transparent
-        image = image.resize((256, 192)).convert("RGB").quantize(199, method=Image.MAXCOVERAGE)
-        self.palette = np.zeros((min(len(image.palette.colors), 199) + 1, 4), np.uint8)
-        logging.info(f"Replacing background {self._last_filename} with image of size {image.size} and palette of "
-                     f"length {len(self.palette)}")
-        self.palette[0] = (0, 255, 0, 0)
-        for color, i in image.palette.colors.items():
-            if i >= 200:
-                break
-            self.palette[i + 1][:3] = color[:3]
-            self.palette[i + 1][3] = 255
-        self.image[:] = np.asarray(image, np.uint8) + 1  # Add one to account for transparent color
+        image = image.resize((256, 192)).convert("RGB")
+
+        # fezzypixels (high quality quantizer) uses floating point for color computation, convert to fp
+        image_fp = rgb888_to_norm(np.array(image))
+
+        # For best quality, repeat flat areas. Use median-cut to solve and 5 k-means passes on eighth resolution to refine
+        palette_input = flatten_with_flat_roi_enhancement(image_fp, pattern_dither_to_srgb555(image_fp, n=4, q=0.8))
+        palette = refine_palette(palette_input[::8], median_cut_srgb_palette(palette_input, count_colors=199), iterations=5) 
+
+        # Convert from RGB_FP32 to RGBA_8888
+        self.palette = np.ones((palette.shape[0] + 1, 4), dtype=np.uint8) * 255
+        self.palette[1:,:3] = (palette * 255).astype(np.uint8)
+
+        self.palette[0] = (0, 255, 0, 255)
+        self.image = error_diffusion_dither_srgb(image_fp, palette, error_weight=0.825) + 1  # Add one to account for transparent color

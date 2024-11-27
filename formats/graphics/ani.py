@@ -1,6 +1,5 @@
 import logging
 from dataclasses import dataclass, field
-from io import BytesIO
 from math import floor, ceil, log
 from typing import *
 from typing import BinaryIO
@@ -14,6 +13,10 @@ from PIL import Image
 from formats.binary import BinaryReader, BinaryWriter, SEEK_CUR
 from formats.filesystem import FileFormat
 
+from fezzypixels.shift import rgb888_to_norm
+from fezzypixels.palette import median_cut_srgb_palette, flatten_with_flat_roi_enhancement, refine_palette
+from fezzypixels.preprocess import pattern_dither_to_srgb555
+from fezzypixels.error_diffuse import error_diffusion_dither_srgb
 
 # Calculate and write the sections
 def get_nearest_power_of_2(x: int):
@@ -78,35 +81,46 @@ def generate_palette(images: List[Image.Image], maximum_color_count: int):
         The second element are the images as a list of ndarrays. The images are represented
         row-first, so they are accessed images[image_index][row][column].
     """
+    # Merge image onto one sheet. Add pixel gap between images
     comb_w = max([img.width for img in images])
     comb_h = sum([img.height for img in images])
-    comb = Image.new("RGBA", (comb_w, comb_h))
+    comb = Image.new("RGBA", (comb_w, comb_h + (len(images) - 1)))
     comb_y = 0
     for i in range(len(images)):
         comb.paste(images[i], (0, comb_y))
-        comb_y += images[i].height
-    comb = comb.convert("P", colors=(maximum_color_count - 1))
-    colors = np.frombuffer(comb.palette.palette, np.uint8).reshape((-1, 4))
-    indexes = np.asarray(comb, np.uint8)
+        comb_y += images[i].height + 1  # Gap is added to account for diffusion
+                                        # Floyd-Steinberg (default fezzypixel kernel) diffuses 1 down. We want to add a blank gap
+                                        #     between each image to prevent error from one image passing to the next
+    
+    # Convert to numpy
+    comb = np.array(comb)
+    skip_mask = comb[..., 3] <= 128     # Extract alpha for skipping during diffusion
+    comb = comb[..., :3]                # Convert to RGB, disregard alpha (restored later)
 
-    # add the regular transparent color
-    colors = np.concatenate(([[0, 255, 0, 0]], colors[:(maximum_color_count - 1)]))
-    indexes = indexes + 1  # we added our transparent color at the front of the palette
-    for i, (*_, a) in enumerate(colors):
-        if a < 128:
-            indexes[indexes == i] = 0  # transparent color, change to the transparent type
+    # fezzypixels (high quality quantizer) uses floating point for color computation, convert to fp
+    image_fp = rgb888_to_norm(comb)
 
-    palette = np.zeros((len(colors), 4), np.uint8)
-    palette[:len(colors)] = colors
+    # For best quality, repeat flat areas. Use median-cut to solve and 5 k-means passes on eighth resolution to refine
+    palette_input = flatten_with_flat_roi_enhancement(image_fp, pattern_dither_to_srgb555(image_fp, n=4, q=0.8), skip_mask=skip_mask)
+    palette_fp = refine_palette(palette_input, median_cut_srgb_palette(palette_input, count_colors=maximum_color_count - 1), iterations=5) 
+    comb = error_diffusion_dither_srgb(image_fp, palette_fp, skip_mask=skip_mask, error_weight=0.825) + 1 # we added our transparent color at the front of the palette
+
+    # Convert from RGB_FP32 to RGBA_8888
+    palette = np.ones((maximum_color_count, 4), dtype=np.uint8) * 255
+    palette[0] = (0, 255, 0, 0)     # TODO - Maybe choose random color not already used?
+    palette[1:,:3] = (palette_fp * 255).astype(np.uint8)
+
+    # Fix alpha regions, these will contain bad color
+    comb[skip_mask == True] = 0
 
     images_numpy = []
 
     comb_y = 0
     for i in range(len(images)):
         h, w = images[i].height, images[i].width
-        image_numpy = indexes[comb_y:comb_y + h, :w]
+        image_numpy = comb[comb_y:comb_y + h, :w]
         images_numpy.append(image_numpy)
-        comb_y += h
+        comb_y += h + 1 # Account for one pixel gap
 
     return palette, images_numpy
 
@@ -141,6 +155,8 @@ class Animation:
     """Animation index that the child should play."""
 
 
+# TODO - Quality loss problem with palettes. Expand palette as needed, don't restrict to original (i.e., adding a colorful image to one with just 16
+#        cause major degradation)
 class AniSprite(FileFormat):
     """
     Animation file on the Layton ROM.
@@ -212,7 +228,6 @@ class AniSprite(FileFormat):
                 part_w = 2 ** (3 + rdr.read_uint16())
                 part_h = 2 ** (3 + rdr.read_uint16())
 
-                part: np.ndarray
                 if self.color_depth == 8:
                     part = np.frombuffer(rdr.read(part_h * part_w), np.uint8)
                     part = part.reshape((part_h, part_w))
@@ -332,7 +347,6 @@ class AniSprite(FileFormat):
 
         wtr.write_uint32(len(self.palette))
         for color_i in range(len(self.palette)):
-            self.palette[color_i]: np.ndarray
             self.palette[color_i, 3] = 0
             wtr.write_uint16(ndspy.color.pack255(*self.palette[color_i].astype(np.uint16)))
             if color_i:
@@ -533,7 +547,6 @@ class AniSubSprite(AniSprite):
                 part_y = rdr.read_uint16()
                 part_w = 2 ** (3 + rdr.read_uint16())
                 part_h = 2 ** (3 + rdr.read_uint16())
-                part: np.ndarray
                 if self.color_depth == 8:
                     part = np.frombuffer(rdr.read(part_h * part_w), np.uint8)
                 else:
@@ -712,7 +725,6 @@ class AniSubSprite(AniSprite):
             wtr.seek(last_pos)
 
         for color_i in range(len(self.palette)):
-            self.palette[color_i]: np.ndarray
             self.palette[color_i, 3] = 0
             wtr.write_uint16(ndspy.color.pack255(*self.palette[color_i].astype(np.uint16)))
             if color_i:
