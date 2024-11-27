@@ -80,9 +80,8 @@ class BGImage(FileFormat):
 
         wtr.write_uint32(len(self.palette))
         for color_i in range(len(self.palette)):
-            self.palette[color_i]: np.ndarray
             self.palette[color_i, 3] = 0
-            wtr.write_uint16(ndspy.color.pack255(*self.palette[color_i]))
+            wtr.write_uint16(ndspy.color.pack255(*self.palette[color_i].astype(np.uint16)))
             self.palette[color_i, 3] = 255
 
         img_h, img_w = self.image.shape

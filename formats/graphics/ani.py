@@ -334,7 +334,7 @@ class AniSprite(FileFormat):
         for color_i in range(len(self.palette)):
             self.palette[color_i]: np.ndarray
             self.palette[color_i, 3] = 0
-            wtr.write_uint16(ndspy.color.pack255(*self.palette[color_i]))
+            wtr.write_uint16(ndspy.color.pack255(*self.palette[color_i].astype(np.uint16)))
             if color_i:
                 self.palette[color_i, 3] = 255
 
@@ -714,7 +714,7 @@ class AniSubSprite(AniSprite):
         for color_i in range(len(self.palette)):
             self.palette[color_i]: np.ndarray
             self.palette[color_i, 3] = 0
-            wtr.write_uint16(ndspy.color.pack255(*self.palette[color_i]))
+            wtr.write_uint16(ndspy.color.pack255(*self.palette[color_i].astype(np.uint16)))
             if color_i:
                 self.palette[color_i, 3] = 255
 
